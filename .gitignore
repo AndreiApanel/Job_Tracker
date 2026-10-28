@@ -1,3 +1,43 @@
+# --- Secrets & environment ---
 .env
-node_modules/
+.env.*
+!.env.example
+
+# --- Python ---
 __pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+*.egg-info/
+dist/
+build/
+
+# --- Node / frontend ---
+node_modules/
+frontend/dist/
+.vite/
+*.tsbuildinfo
+coverage/
+playwright-report/
+test-results/
+
+# --- Docker / local data ---
+docker-compose.override.yml
+postgres_data/
+redis_data/
+
+# --- Logs ---
+*.log
+npm-debug.log*
+pnpm-debug.log*
+
+# --- IDE / OS ---
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
