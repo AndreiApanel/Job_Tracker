@@ -121,7 +121,7 @@ erDiagram
 
 ## Columns and constraints
 
-`created_at` defaults to `CURRENT_TIMESTAMP`. `updated_at` defaults to `CURRENT_TIMESTAMP` and is refreshed on updates. UUIDs are generated with `gen_random_uuid()`.
+`created_at` and `updated_at` default to `CURRENT_TIMESTAMP`; SQLAlchemy refreshes `updated_at` with `onupdate=func.now()` for ORM updates. Raw SQL updates must set `updated_at` explicitly. UUIDs are generated with `gen_random_uuid()`.
 
 ### `users` (MVP)
 
@@ -153,7 +153,7 @@ Unique constraint: (`user_id`, `name`) after name normalization. Also declare a 
 | --- | --- | --- | --- |
 | `id` | `UUID` | No | Primary key |
 | `user_id` | `UUID` | No | FK → `users.id`, `ON DELETE CASCADE` |
-| `company_id` | `UUID` | No | Part of composite FK (`user_id`, `company_id`) → `companies` (`user_id`, `id`), `ON DELETE RESTRICT` |
+| `company_id` | `UUID` | No | Part of composite FK (`user_id`, `company_id`) → `companies` (`user_id`, `id`), `ON DELETE NO ACTION DEFERRABLE INITIALLY DEFERRED` |
 | `job_title` | `VARCHAR(200)` | No | |
 | `status` | `VARCHAR(20)` | No | Default `saved`; CHECK: `saved`, `applied`, `screening`, `interviewing`, `offer`, `rejected`, `withdrawn` |
 | `job_url` | `VARCHAR(2048)` | Yes | |
@@ -181,14 +181,14 @@ Also declare a unique constraint on (`id`, `company_id`) for the later-phase com
 | `id` | `UUID` | No | Primary key |
 | `application_id` | `UUID` | No | FK → `applications.id`, `ON DELETE CASCADE` |
 | `event_type` | `VARCHAR(20)` | No | CHECK: `status_changed`, `note`, `email`, `call`, `other` |
-| `from_status` | `VARCHAR(20)` | Yes | Previous status for a transition |
-| `to_status` | `VARCHAR(20)` | Yes | New status for a transition |
+| `from_status` | `VARCHAR(20)` | Yes | Previous status for a transition; null only for the initial status event |
+| `to_status` | `VARCHAR(20)` | Yes | New status for a transition; required for `status_changed` events |
 | `title` | `VARCHAR(200)` | No | |
 | `details` | `TEXT` | Yes | |
 | `occurred_at` | `TIMESTAMPTZ` | No | Defaults to `CURRENT_TIMESTAMP`; event time used for stage-duration reporting |
 | `created_at` | `TIMESTAMPTZ` | No | `CURRENT_TIMESTAMP` |
 
-For `status_changed` events, require both `from_status` and `to_status`; other event types leave them null. Add an index on (`application_id`, `occurred_at`).
+For `status_changed` events, require `to_status` and apply the same allowed-status CHECK as `applications.status` to both status columns. `from_status` is null only on the initial status event; create this event with `to_status` equal to the application's starting status in the same transaction as the application insert. This handles imported applications that start in a later stage without inferring their initial duration from `applications.created_at`. Other event types leave both status fields null. Add an index on (`application_id`, `occurred_at`) and a unique partial index on (`application_id`) where `event_type = 'status_changed' AND from_status IS NULL` so an application has at most one initial status event.
 
 ### `contacts` (later)
 
@@ -252,6 +252,7 @@ Add an index on (`status`, `due_at`) to find pending reminders that are due.
 
 - **Tenant isolation and contacts:** Applications reference a company through a composite (`user_id`, `company_id`) foreign key, preventing cross-user company links at the database level. Contacts have no direct `user_id`; ownership is derived through `contacts.company_id → companies.user_id`, so contact queries must join through the company and filter by its owner. Composite foreign keys also ensure application-contact links stay within one company.
 - **Interviews versus activities:** Interviews store structured scheduling, round, and outcome data; activities record the chronological timeline, including status changes and communications. This keeps interview queries reliable without limiting the activity log to interviews.
-- **Current status versus history:** `applications.status` is the current value for fast kanban filtering. Each transition is also an `application_activities` row with `from_status`, `to_status`, and `occurred_at`; transitions should be recorded transactionally with the current status update. Stage durations are calculated from consecutive transition timestamps, using `applications.created_at` as the start of the initial stage.
-- **Deletion:** Deleting an application cascades to its activities and later-phase child rows. Company deletion is restricted while applications reference it, so account deletion removes applications before companies in one transaction. No soft deletion in the MVP.
+- **Current status versus history:** `applications.status` is the current value for fast kanban filtering. Each transition is also an `application_activities` row with `from_status`, `to_status`, and `occurred_at`; transitions should be recorded transactionally with the current status update. Application creation also writes an initial event (`from_status = NULL`, `to_status = status`), so stage durations can be calculated from the event history, including for imports.
+- **Deletion:** Deleting a user cascades to their companies and applications; deleting an application cascades to its activities and later-phase child rows. The composite application-to-company FK uses deferred `NO ACTION`, allowing the user-delete statement's cascades to remove both rows before the constraint is checked at transaction end. No soft deletion in the MVP.
 - **Identifiers:** UUID primary keys are used instead of sequential integers because they are difficult to guess and remain unique across imports or future distributed components; PostgreSQL generates them with `gen_random_uuid()`.
+- **`updated_at` maintenance:** SQLAlchemy's `onupdate=func.now()` refreshes this timestamp for ORM updates, avoiding a database trigger in the MVP. Updates issued as raw SQL must set `updated_at` explicitly.
