@@ -48,7 +48,7 @@ erDiagram
         string salary_currency
         date applied_at "nullable"
         string source "nullable"
-        integer sort_order
+        integer sort_order "unique position within user's status column"
         text description "nullable"
         text notes "nullable"
         datetime created_at
@@ -57,6 +57,7 @@ erDiagram
     APPLICATION_ACTIVITIES {
         uuid id PK
         uuid application_id FK
+        integer event_sequence
         string event_type
         string from_status "nullable"
         string to_status "nullable"
@@ -128,10 +129,12 @@ erDiagram
 | Column | PostgreSQL type | Null? | Key / default / constraint |
 | --- | --- | --- | --- |
 | `id` | `UUID` | No | Primary key |
-| `email` | `VARCHAR(320)` | No | Unique; normalize to lowercase |
+| `email` | `VARCHAR(320)` | No | |
 | `hashed_password` | `VARCHAR(255)` | No | Store a password hash, never a plaintext password |
 | `created_at` | `TIMESTAMPTZ` | No | `CURRENT_TIMESTAMP` |
 | `updated_at` | `TIMESTAMPTZ` | No | `CURRENT_TIMESTAMP`; refresh on update |
+
+Create a case-insensitive unique index: `CREATE UNIQUE INDEX uq_users_email_lower ON users (lower(email))`.
 
 ### `companies` (MVP)
 
@@ -139,13 +142,13 @@ erDiagram
 | --- | --- | --- | --- |
 | `id` | `UUID` | No | Primary key |
 | `user_id` | `UUID` | No | FK → `users.id`, `ON DELETE CASCADE` |
-| `name` | `VARCHAR(200)` | No | Trim and normalize before saving |
+| `name` | `VARCHAR(200)` | No | Trim before saving |
 | `website` | `VARCHAR(2048)` | Yes | |
 | `location` | `VARCHAR(200)` | Yes | |
 | `created_at` | `TIMESTAMPTZ` | No | `CURRENT_TIMESTAMP` |
 | `updated_at` | `TIMESTAMPTZ` | No | `CURRENT_TIMESTAMP`; refresh on update |
 
-Unique constraint: (`user_id`, `name`) after name normalization. Also declare a unique constraint on (`user_id`, `id`) so applications can reference a company and its owner together.
+Create a unique index `CREATE UNIQUE INDEX uq_companies_user_name_lower ON companies (user_id, lower(name))` to prevent case-only duplicates. Also declare a unique constraint on (`user_id`, `id`) so applications can reference a company and its owner together.
 
 ### `applications` (MVP)
 
@@ -155,7 +158,7 @@ Unique constraint: (`user_id`, `name`) after name normalization. Also declare a 
 | `user_id` | `UUID` | No | FK → `users.id`, `ON DELETE CASCADE` |
 | `company_id` | `UUID` | No | Part of composite FK (`user_id`, `company_id`) → `companies` (`user_id`, `id`), `ON DELETE NO ACTION DEFERRABLE INITIALLY DEFERRED` |
 | `job_title` | `VARCHAR(200)` | No | |
-| `status` | `VARCHAR(20)` | No | Default `saved`; CHECK: `saved`, `applied`, `screening`, `interviewing`, `offer`, `rejected`, `withdrawn` |
+| `status` | `VARCHAR(20)` | No | Default `saved`; CHECK generated from the Python `ApplicationStatus` enum |
 | `job_url` | `VARCHAR(2048)` | Yes | |
 | `location` | `VARCHAR(200)` | Yes | |
 | `employment_type` | `VARCHAR(30)` | Yes | CHECK: `full_time`, `part_time`, `contract`, `internship`, `temporary`, `other` |
@@ -164,13 +167,13 @@ Unique constraint: (`user_id`, `name`) after name normalization. Also declare a 
 | `salary_currency` | `CHAR(3)` | No | Default `USD`; ISO 4217 currency code |
 | `applied_at` | `DATE` | Yes | |
 | `source` | `VARCHAR(120)` | Yes | For example, referral or job board |
-| `sort_order` | `INTEGER` | No | Default `0`; controls card order within a status column |
+| `sort_order` | `INTEGER` | No | Explicit position within the user's status column; no database default |
 | `description` | `TEXT` | Yes | |
 | `notes` | `TEXT` | Yes | |
 | `created_at` | `TIMESTAMPTZ` | No | `CURRENT_TIMESTAMP` |
 | `updated_at` | `TIMESTAMPTZ` | No | `CURRENT_TIMESTAMP`; refresh on update |
 
-Add an index on (`user_id`, `status`, `sort_order`) for the user's kanban view.
+Add an index on (`user_id`, `status`, `sort_order`) for the user's kanban view. The service assigns the next available position (`MAX(sort_order) + 1`) on card creation or when a card moves to another status; it serializes ordering operations per user so concurrent inserts or moves cannot assign duplicate positions. Reordering updates affected positions in one transaction.
 
 Also declare a unique constraint on (`id`, `company_id`) for the later-phase composite foreign key from `application_contacts`.
 
@@ -180,15 +183,18 @@ Also declare a unique constraint on (`id`, `company_id`) for the later-phase com
 | --- | --- | --- | --- |
 | `id` | `UUID` | No | Primary key |
 | `application_id` | `UUID` | No | FK → `applications.id`, `ON DELETE CASCADE` |
+| `event_sequence` | `INTEGER` | No | Monotonically increasing within an application; unique with `application_id` |
 | `event_type` | `VARCHAR(20)` | No | CHECK: `status_changed`, `note`, `email`, `call`, `other` |
-| `from_status` | `VARCHAR(20)` | Yes | Previous status for a transition; null only for the initial status event |
+| `from_status` | `VARCHAR(20)` | Yes | Previous status for a transition; null on the initial status event |
 | `to_status` | `VARCHAR(20)` | Yes | New status for a transition; required for `status_changed` events |
 | `title` | `VARCHAR(200)` | No | |
 | `details` | `TEXT` | Yes | |
 | `occurred_at` | `TIMESTAMPTZ` | No | Defaults to `CURRENT_TIMESTAMP`; event time used for stage-duration reporting |
 | `created_at` | `TIMESTAMPTZ` | No | `CURRENT_TIMESTAMP` |
 
-For `status_changed` events, require `to_status` and apply the same allowed-status CHECK as `applications.status` to both status columns. `from_status` is null only on the initial status event; create this event with `to_status` equal to the application's starting status in the same transaction as the application insert. This handles imported applications that start in a later stage without inferring their initial duration from `applications.created_at`. Other event types leave both status fields null. Add an index on (`application_id`, `occurred_at`) and a unique partial index on (`application_id`) where `event_type = 'status_changed' AND from_status IS NULL` so an application has at most one initial status event.
+Generate the CHECK constraints on `from_status` and `to_status` from the same Python `ApplicationStatus` enum used for `applications.status`. Add a table CHECK requiring `event_type = 'status_changed' OR (from_status IS NULL AND to_status IS NULL)`, plus a CHECK requiring `to_status IS NOT NULL` whenever `event_type = 'status_changed'`. `from_status` is null only on the initial status event; create this event with `to_status` equal to the application's starting status in the same transaction as the application insert. This handles imported applications that start in a later stage without inferring their initial duration from `applications.created_at`. Add an index on (`application_id`, `occurred_at`) and unique constraints/indexes on (`application_id`, `event_sequence`) and on (`application_id`) where `event_type = 'status_changed' AND from_status IS NULL`.
+
+Assign `event_sequence` monotonically per application in the same serialized transaction that writes the event. Order history by (`occurred_at`, `event_sequence`): events with the same PostgreSQL transaction-time default remain deterministic, while elapsed durations use their `occurred_at` timestamps.
 
 ### `contacts` (later)
 
@@ -222,7 +228,7 @@ Declare unique constraints on (`id`, `company_id`) in `contacts` and composite f
 | --- | --- | --- | --- |
 | `id` | `UUID` | No | Primary key |
 | `application_id` | `UUID` | No | FK → `applications.id`, `ON DELETE CASCADE` |
-| `round_number` | `INTEGER` | No | Must be >= 1 |
+| `round_number` | `INTEGER` | No | Must be >= 1; unique per application |
 | `interview_type` | `VARCHAR(30)` | No | For example, phone, video, onsite, or take_home |
 | `scheduled_at` | `TIMESTAMPTZ` | Yes | Null until scheduled |
 | `duration_minutes` | `INTEGER` | Yes | Must be > 0 when set |
@@ -231,6 +237,8 @@ Declare unique constraints on (`id`, `company_id`) in `contacts` and composite f
 | `notes` | `TEXT` | Yes | |
 | `created_at` | `TIMESTAMPTZ` | No | `CURRENT_TIMESTAMP` |
 | `updated_at` | `TIMESTAMPTZ` | No | `CURRENT_TIMESTAMP`; refresh on update |
+
+Unique constraint: (`application_id`, `round_number`).
 
 ### `reminders` (later)
 
@@ -253,6 +261,10 @@ Add an index on (`status`, `due_at`) to find pending reminders that are due.
 - **Tenant isolation and contacts:** Applications reference a company through a composite (`user_id`, `company_id`) foreign key, preventing cross-user company links at the database level. Contacts have no direct `user_id`; ownership is derived through `contacts.company_id → companies.user_id`, so contact queries must join through the company and filter by its owner. Composite foreign keys also ensure application-contact links stay within one company.
 - **Interviews versus activities:** Interviews store structured scheduling, round, and outcome data; activities record the chronological timeline, including status changes and communications. This keeps interview queries reliable without limiting the activity log to interviews.
 - **Current status versus history:** `applications.status` is the current value for fast kanban filtering. Each transition is also an `application_activities` row with `from_status`, `to_status`, and `occurred_at`; transitions should be recorded transactionally with the current status update. Application creation also writes an initial event (`from_status = NULL`, `to_status = status`), so stage durations can be calculated from the event history, including for imports.
-- **Deletion:** Deleting a user cascades to their companies and applications; deleting an application cascades to its activities and later-phase child rows. The composite application-to-company FK uses deferred `NO ACTION`, allowing the user-delete statement's cascades to remove both rows before the constraint is checked at transaction end. No soft deletion in the MVP.
-- **Identifiers:** UUID primary keys are used instead of sequential integers because they are difficult to guess and remain unique across imports or future distributed components; PostgreSQL generates them with `gen_random_uuid()`.
+- **Deletion:** Deleting a user cascades to their companies and applications; deleting an application cascades to its activities and later-phase child rows. The composite application-to-company FK uses deferred `NO ACTION`, allowing the user-delete statement's cascades to remove both rows before the constraint is checked at transaction end. A company delete that leaves applications will fail at commit; the FastAPI service must catch the resulting integrity error around `commit()` and return HTTP 409 Conflict. No soft deletion in the MVP.
+- **Constraint style and status source of truth:** Define allowed application stages once as a Python `ApplicationStatus` enum, and generate the database CHECK constraints for `applications.status`, `application_activities.from_status`, and `application_activities.to_status` from its values. Store them as strings with CHECK constraints rather than PostgreSQL native `ENUM`s, keeping the Python enum canonical and schema changes migration-friendly.
+- **Card ordering:** `sort_order` is explicitly assigned by the service: append at `MAX(sort_order) + 1` on creation or status-column moves, and renumber affected cards transactionally during drag-and-drop reorder. Per-user serialization prevents concurrent operations from assigning duplicate positions.
+- **Identifiers:** UUID primary keys avoid sequential ID enumeration in URLs and allow IDs to be generated by the application before insert; PostgreSQL can also generate them with `gen_random_uuid()`.
 - **`updated_at` maintenance:** SQLAlchemy's `onupdate=func.now()` refreshes this timestamp for ORM updates, avoiding a database trigger in the MVP. Updates issued as raw SQL must set `updated_at` explicitly.
+- **Event timestamps:** PostgreSQL `CURRENT_TIMESTAMP` and `func.now()` use transaction start time. Events written in one transaction can therefore share `occurred_at`; a per-application `event_sequence` provides deterministic ordering for ties. Equal timestamps correctly represent zero elapsed time between same-transaction transitions.
+- **Open questions:** Confirm whether `USD` is an appropriate default for `salary_currency` or whether it should be required only when salary data is entered. Clarify whether `applied_at` is user-entered application metadata or should be derived from the first transition to `applied`; for now it remains an optional field distinct from status history.
