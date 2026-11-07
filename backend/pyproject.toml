@@ -29,3 +29,7 @@ python_version = "3.12"
 explicit_package_bases = true
 mypy_path = "."
 plugins = ["pydantic.mypy"]
+[tool.ruff]
+src = ["."]
+[tool.ruff.lint.isort]
+known-first-party = ["app"]
