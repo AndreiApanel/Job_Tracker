@@ -1,7 +1,8 @@
-from app.api.deps import DbSession
-from app.schemas.health import HealthResponse
 from fastapi import APIRouter
 from sqlalchemy import text
+
+from app.api.deps import DbSession
+from app.schemas.health import HealthResponse
 
 router = APIRouter()
 
